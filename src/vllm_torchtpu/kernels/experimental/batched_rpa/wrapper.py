@@ -1005,6 +1005,8 @@ def ragged_paged_attention(
         )
     else:
         )
+        # [distribution[0], distribution[2]) (`configs.RpaConfigs.seq_range`)
+        # is empty.
 
         else:
                 )
