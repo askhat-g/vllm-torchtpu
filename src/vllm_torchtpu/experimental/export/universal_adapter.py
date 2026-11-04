@@ -976,12 +976,14 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         self._mtp_draft = getattr(model, MTP_DRAFT_ATTR, None)
         self._draft_model = getattr(model, draft_model.DRAFT_MODEL_ATTR, None)
         self._patched_rope_modules = rope_patch.patch_in_graph_rotary_embedding(
-            self._model
+            self._model, allow_table_recovery=True
         )
         for draft in (self._mtp_draft, self._draft_model):
             if draft is not None:
                 self._patched_rope_modules += (
-                    rope_patch.patch_in_graph_rotary_embedding(draft)
+                    rope_patch.patch_in_graph_rotary_embedding(
+                        draft, allow_table_recovery=True
+                    )
                 )
         _patch_row_parallel_input_split(self._model)
         for draft in (self._mtp_draft, self._draft_model):
