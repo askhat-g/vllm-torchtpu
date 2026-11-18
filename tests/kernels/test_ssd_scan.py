@@ -1028,3 +1028,54 @@ def test_ssd_scan_grouped_multi_blocks_per_group_interpret_and_mamba2_27b_loweri
         )
         assert "ssd_chunk_state_pallas" in exported.mlir_module()
         assert "ssd_chunk_scan_pallas" in exported.mlir_module()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_ssd_scan_mamba2_27b_80_heads_tpu(dtype):
+    """Compile and run mamba2-2.7b (`n_heads=80, head_block=40`) on TPU."""
+    X_c, A_c, B_c, C_c, last_chunk_indices, initial_states, reset_mask = (
+        _make_ssd_inputs(
+            batch=1,
+            seqlen=128,
+            block_len=64,
+            n_heads=80,
+            d_head=64,
+            d_state=128,
+            n_groups=1,
+            dtype=dtype,
+        )
+    )
+    y_ref, final_state_ref = ssd_sequential_reference(
+        X_c,
+        A_c,
+        B_c,
+        C_c,
+        last_chunk_indices,
+        initial_states,
+        reset_mask,
+    )
+    y_got, final_state_got = jax.jit(ssd_minimal_discrete_hybrid)(
+        X_c,
+        A_c,
+        B_c,
+        C_c,
+        last_chunk_indices,
+        initial_states,
+        reset_mask,
+    )
+    assert y_got.dtype == dtype
+    assert final_state_got.dtype == jnp.float32
+    np.testing.assert_allclose(
+        np.asarray(final_state_got),
+        np.asarray(final_state_ref),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    tol = 2e-2 if dtype == jnp.bfloat16 else 1e-3
+    np.testing.assert_allclose(
+        np.asarray(y_got.astype(jnp.float32)),
+        np.asarray(y_ref.astype(jnp.float32)),
+        rtol=tol,
+        atol=tol,
+    )

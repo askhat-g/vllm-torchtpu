@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pallas TPU kernels for Mamba-2 Selective State Space (SSD) scan."""
+"""Pallas TPU kernels for Mamba-2 and Mamba-3 Selective State Space (SSD) scan."""
 
 from vllm_torchtpu.kernels.ssd_scan.ssd_scan import (
     chunk_scan_pallas,
