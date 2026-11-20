@@ -15,15 +15,23 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import subprocess
+import sys
+import types
+from pathlib import Path
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import vllm_torchtpu.megakernel.core as mk
 from tests.megakernel.core.megakernel_synth import TINY_TILES, synth_hybrid_spec
 from vllm_torchtpu.megakernel.core import model_def, planner, profile
+from vllm_torchtpu.megakernel.core import runtime as mk_rt
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.geometry import ModelGeometry
 from vllm_torchtpu.megakernel.core.model_def import (
@@ -42,12 +50,24 @@ from vllm_torchtpu.megakernel.core.profile import DEFAULT_PROFILE, Profile
 from vllm_torchtpu.megakernel.core.runtime import (
     BucketPolicy,
     JaxStepMetaOps,
+    SentinelVariantPlan,
+    WarmupStepPlan,
+    align_cache_exec,
     bucket_exec_spec,
+    build_warmup_plan,
+    check_compile_hlo_mesh,
+    check_post_mesh_eligibility,
+    check_startup_eligibility,
     explicit_profile_settings,
+    ir_required_buckets,
     pack_step_meta,
     parse_runtime_config,
+    pool_schedule_info,
     resolve_driver_profile,
     resolve_step_positions,
+    verify_compiled_step_ir,
+    verify_ir_coverage,
+    verify_sentinel_step,
 )
 
 
@@ -60,6 +80,48 @@ def isolated_model_registry(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(profile, "_REGISTRY", dict(profile._REGISTRY))
     monkeypatch.setattr(profile, "_MODEL_DEFAULTS", dict(profile._MODEL_DEFAULTS))
+
+
+def test_runtime_package_ast_and_fresh_import_free_of_vllm_and_torch():
+    """`megakernel/core/runtime/*.py` never imports `vllm`/`torch`/`os` and <= 400
+    lines."""
+    runtime_dir = Path(mk_rt.__file__).parent
+    py_files = sorted(runtime_dir.glob("*.py"))
+    assert len(py_files) == 10
+
+    for py_path in py_files:
+        src = py_path.read_text(encoding="utf-8")
+        lines = src.splitlines()
+        assert len(lines) <= 400, f"{py_path.name} has {len(lines)} lines (> 400)"
+        assert "qwen" not in src.lower(), f"{py_path.name} mentions Qwen"
+        tree = ast.parse(src, filename=str(py_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    assert top not in ("torch", "vllm", "os"), (
+                        f"{py_path.name} imports {alias.name}"
+                    )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top = node.module.split(".")[0]
+                assert top not in ("torch", "vllm", "os"), (
+                    f"{py_path.name} imports from {node.module}"
+                )
+
+    code = (
+        "import sys; "
+        "sys.modules['torch'] = None; "
+        "sys.modules['vllm'] = None; "
+        "import vllm_torchtpu.megakernel.core.runtime as rt; "
+        "assert hasattr(rt, 'BucketPolicy') and hasattr(rt, 'pack_step_meta')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
 
 
 def test_runtime_config_and_gpr_bucket_exec_spec():
@@ -549,3 +611,242 @@ def test_schedule_driven_validate_hf_config(isolated_model_registry):
     assert not SynthSeqOverridesFFN.validate_hf_config(
         {**SynthSeqOverridesFFN.default_hf_config, "alt_expert_count": 0}
     ).eligible
+
+
+def test_checks_hlo_ir_warmup_and_sentinel():
+    """Test `check_compile_hlo_mesh`, `verify_compiled_step_ir`, and IR coverage."""
+    cpu_mesh = jax.sharding.Mesh(np.asarray(jax.devices("cpu")[:2]), ("tp",))
+    check_compile_hlo_mesh(cpu_mesh, True)
+    fake_mesh = types.SimpleNamespace(devices=np.asarray([object(), object()]))
+    with pytest.raises(mk.MegakernelConfigError, match="requires a mesh of real"):
+        check_compile_hlo_mesh(fake_mesh, True)
+
+    good_ir = """
+    module @test {
+      func.func public @main(
+        %arg0: tensor<64x2x64x4x128xf8E4M3FN> {tf.aliasing_output = 1 : i32},
+        %arg1: tensor<64x2x64x4x128xf8E4M3FN> {tf.aliasing_output = 2 : i32}
+      ) -> (
+        tensor<8x1024xbf16>,
+        tensor<64x2x64x4x128xf8E4M3FN>,
+        tensor<64x2x64x4x128xf8E4M3FN>
+      ) {
+        %0 = stablehlo.custom_call @tpu_custom_call(%arg0, %arg1)
+          : (tensor<64x2x64x4x128xf8E4M3FN>, tensor<64x2x64x4x128xf8E4M3FN>)
+          -> tensor<8x1024xbf16>
+        return
+      }
+    }
+    """
+    ok_ir, msg_ir = verify_compiled_step_ir(
+        good_ir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=2
+    )
+    assert ok_ir, msg_ir
+
+    bad_ir = good_ir.replace("{tf.aliasing_output = 2 : i32}", "")
+    ok_bad, msg_bad = verify_compiled_step_ir(
+        bad_ir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=2
+    )
+    assert not ok_bad and "expected >= 2 donated pool arguments" in msg_bad
+
+    assert ir_required_buckets(
+        [(1, 8), (1, 16), (4, 16)],
+        {(1, 8): True, (1, 16): False, (4, 16): True},
+        is_eager=False,
+    ) == [(1, 8), (1, 16), (4, 16)]
+    assert ir_required_buckets([(1, 8)], {(1, 8): True}, is_eager=True) == [(1, 8)]
+    assert ir_required_buckets([(1, 8)], {(1, 8): False}, is_eager=True) == []
+
+    # verify_ir_coverage tests
+    verify_ir_coverage([(1, 8)], {(1, 8): True}, {(1, 8)}, is_eager=False)
+    verify_ir_coverage([], {}, set(), is_eager=False)
+    with pytest.raises(RuntimeError, match="boom"):
+        verify_ir_coverage(
+            [(1, 8)], {(1, 8): True}, {(1, 8)}, is_eager=False, ir_error="boom"
+        )
+    with pytest.raises(RuntimeError, match="did not run for buckets"):
+        verify_ir_coverage(
+            [(1, 8), (1, 16)],
+            {(1, 8): True, (1, 16): True},
+            {(1, 8)},
+            is_eager=False,
+        )
+
+    # pool_schedule_info raises MegakernelLayoutError when cache_backend is absent
+    with pytest.raises(mk.MegakernelLayoutError, match="has no pool backend layout"):
+        pool_schedule_info(types.SimpleNamespace(cache_backend=None))
+
+
+def test_no_kw_rejects_legacy_and_unknown_kwargs():
+    """Runtime API functions reject legacy or unknown keyword arguments."""
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        check_startup_eligibility(  # type: ignore[call-arg]
+            num_layers=60,
+            expected_num_layers=60,
+            tp_size=8,
+            supported_tp_sizes=(8,),
+            unified_kv_layout=True,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        check_startup_eligibility(  # type: ignore[call-arg]
+            num_layers=60,
+            expected_num_layers=60,
+            tp_size=8,
+            supported_tp_sizes=(8,),
+            supports_mm_inputs=False,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        check_startup_eligibility(  # type: ignore[call-arg]
+            num_layers=60,
+            expected_num_layers=60,
+            tp_size=8,
+            supported_tp_sizes=(8,),
+            unknown_flag=True,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        check_post_mesh_eligibility(  # type: ignore[call-arg]
+            tp_size=8,
+            num_layers=60,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        resolve_driver_profile(DEFAULT_PROFILE, unknown_flag=True)  # type: ignore[call-arg]
+
+    g = ModelGeometry(
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=1,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
+    )
+    ms = synth_hybrid_spec(g, R=1)
+    base_ex = ExecSpec(R=1, B=4, T=1, ctx=256, interpret=True, stack_e=False)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        bucket_exec_spec(  # type: ignore[call-arg]
+            ms,
+            base_ex,
+            DEFAULT_PROFILE,
+            bucket_t=4,
+            tokens_per_seq=1,
+            pool_gather=True,
+        )
+    with pytest.raises(TypeError, match="missing 1 required keyword-only argument"):
+        align_cache_exec(  # type: ignore[call-arg]
+            base_ex, DEFAULT_PROFILE, g, num_pages=64, max_pages_per_seq=2
+        )
+    with pytest.raises(TypeError, match="missing .* required keyword-only argument"):
+        verify_compiled_step_ir(  # type: ignore[call-arg]
+            "module {}", num_pages=64, kvh=1
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        build_warmup_plan(  # type: ignore[call-arg]
+            ms, ((1, 4),), {}, {}, num_pages=64, max_pages_per_seq=2, unknown=1
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        verify_sentinel_step(  # type: ignore[call-arg]
+            np.zeros((2, 4)),
+            [],
+            [],
+            [],
+            [],
+            tokens_per_seq=1,
+            bucket_t=2,
+            variant_key=(1, False, False),
+            unknown=1,
+        )
+
+    # `build_warmup_plan` takes `(T, B)` `bucket_keys` directly: default keys
+    # match the pre-generalization `WarmupStepPlan` list byte-for-byte, and
+    # `T=8` verify keys produce plans for `(8, b)` with `spv = spp * 8`.
+    pol_def = BucketPolicy((8, 16), (16, 32))
+    default_keys = list(pol_def.iter_buckets())
+    fio_def = {(1, 8): True, (1, 16): False, (4, 16): True, (4, 32): False}
+    gpr_def = {(1, 8): False, (1, 16): True, (4, 16): False, (4, 32): False}
+    steps_def, warmed_def, n_save_def = build_warmup_plan(
+        ms,
+        default_keys,
+        fio_def,
+        gpr_def,
+        num_pages=256,
+        max_pages_per_seq=4,
+        ckpt_window=4,
+        runner_tok_pads=(16, 32),
+        req_block_pairs=((8, 4), (16, 4)),
+        is_eager=False,
+    )
+    expected_default_steps = [
+        WarmupStepPlan(
+            1, 8, 16, 8, 4, 4, SentinelVariantPlan((1, True, False), 1, 3, 15, 1, True)
+        ),
+        WarmupStepPlan(1, 8, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            1,
+            16,
+            16,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((1, False, True), 2, 15, 75, 1, True),
+        ),
+        WarmupStepPlan(1, 16, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            4,
+            16,
+            16,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((4, True, False), 3, 27, 135, 4, True),
+        ),
+        WarmupStepPlan(4, 16, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            4,
+            32,
+            32,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((4, False, False), 4, 39, 195, 4, True),
+        ),
+        WarmupStepPlan(4, 32, 32, 16, 4, 4, None),
+    ]
+    assert steps_def == expected_default_steps
+    assert repr(steps_def) == repr(expected_default_steps)
+    assert warmed_def == default_keys and n_save_def == 255
+
+    keys_t8 = [(1, 8), (8, 16), (8, 32)]
+    fio_t8 = {(1, 8): True, (8, 16): True, (8, 32): False}
+    gpr_t8 = {(1, 8): False, (8, 16): False, (8, 32): False}
+    steps_t8, warmed_t8, n_save_t8 = build_warmup_plan(
+        ms,
+        keys_t8,
+        fio_t8,
+        gpr_t8,
+        num_pages=512,
+        max_pages_per_seq=4,
+        ckpt_window=4,
+        is_eager=False,
+    )
+    assert warmed_t8 == keys_t8
+    assert [(s.tokens_per_seq, s.bucket_t, s.req_pad, s.c_cols) for s in steps_t8] == [
+        (1, 8, 8, 4),
+        (8, 16, 2, 8),
+        (8, 32, 4, 8),
+    ]
+    assert [s.sentinel for s in steps_t8] == [
+        SentinelVariantPlan((1, True, False), 1, 3, 15, 1, True),
+        SentinelVariantPlan((8, True, False), 2, 27, 135, 8, True),
+        SentinelVariantPlan((8, False, False), 3, 51, 255, 8, True),
+    ]
+    assert n_save_t8 == 375
