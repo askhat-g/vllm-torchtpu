@@ -26,6 +26,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
     should_quantize_on_load,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8Config,
     VllmFp8LinearMethodTPU,
     VllmFp8MoEMethodTPU,
 )
@@ -163,3 +164,84 @@ class TestUnquantizedConfigQuantizeOnLoadDispatch:
                 moe_layer, prefix="model.layers.0.mlp.experts"
             )
         assert isinstance(method, VllmUnquantizedFusedMoEMethod)
+
+
+class TestDummyOnlineFp8MoEWeights:
+    def test_dummy_load_allocates_fp8_buffers_directly_and_skips_quantization(
+        self, monkeypatch, moe_layer
+    ):
+        fp8_mod = __import__(
+            "vllm_torchtpu.layers.adapter.quantization.fp8", fromlist=["*"]
+        )
+        vllm_cfg = MagicMock()
+        vllm_cfg.load_config.load_format = "dummy"
+        cfg = VllmFp8Config(
+            is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+        )
+        cfg.vllm_config = vllm_cfg
+        moe_layer.moe_config.experts_per_token = 8
+        moe_layer.renormalize = True
+        moe_layer.weight_loader = object()
+        method = VllmFp8MoEMethodTPU(cfg, moe_layer.moe_config)
+        monkeypatch.setattr(
+            fp8_mod,
+            "_get_moe_quant_config",
+            lambda _msg: ("float8_e4m3fn", torch.float8_e4m3fn, None),
+        )
+        monkeypatch.setattr(method, "_set_tpu_activation", lambda _l: "silu")
+        quantize_spy = MagicMock(
+            side_effect=AssertionError("should not quantize dummy weights")
+        )
+        monkeypatch.setattr(fp8_mod, "_quantize_bf16_moe_weights", quantize_spy)
+        monkeypatch.setattr(
+            fp8_mod.moe_routing, "register_experts_start_buffer", MagicMock()
+        )
+        monkeypatch.setattr(fp8_mod, "prebuild_fused_moe_kernel", MagicMock())
+        fused_ep_mod = __import__(
+            "vllm_torchtpu.layers.adapter.fused_moe_ep", fromlist=["*"]
+        )
+        monkeypatch.setattr(
+            fused_ep_mod, "prebuild_fused_moe_ep", MagicMock(return_value=None)
+        )
+
+        method.create_weights(
+            moe_layer,
+            num_experts=4,
+            hidden_size=64,
+            intermediate_size_per_partition=130,
+            params_dtype=torch.bfloat16,
+        )
+        assert moe_layer._tpu_dummy_fp8_initialized is True
+        assert moe_layer.w13_weight.shape == (4, 64, 512)
+        assert moe_layer.w13_weight.dtype == torch.float8_e4m3fn
+        assert moe_layer.w13_weight.dummy_weight_value == 0
+        assert moe_layer.w2_weight.shape == (4, 256, 64)
+        assert moe_layer.w2_weight.dtype == torch.float8_e4m3fn
+        assert moe_layer.w13_weight_scale_inv.shape == (4, 1, 1, 512)
+        assert moe_layer.w13_weight_scale_inv.dtype == torch.float32
+        assert moe_layer.w13_weight_scale_inv.dummy_weight_value == 1.0
+        assert moe_layer.w13_weight.weight_loader is moe_layer.weight_loader
+
+        method.process_weights_after_loading(moe_layer)
+        quantize_spy.assert_not_called()
+
+    def test_block_requantize_falls_back_to_bf16_dummy_weights(
+        self, monkeypatch, moe_layer
+    ):
+        fp8_mod = __import__(
+            "vllm_torchtpu.layers.adapter.quantization.fp8", fromlist=["*"]
+        )
+        vllm_cfg = MagicMock()
+        vllm_cfg.load_config.load_format = "dummy"
+        cfg = VllmFp8Config(
+            is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+        )
+        cfg.vllm_config = vllm_cfg
+        method = VllmFp8MoEMethodTPU(cfg, moe_layer.moe_config)
+        monkeypatch.setattr(
+            fp8_mod,
+            "_get_moe_quant_config",
+            lambda _msg: ("float8_e4m3fn", torch.float8_e4m3fn, 128),
+        )
+        assert not method._create_dummy_online_fp8_weights(moe_layer, 4, 64, 130)
+        assert not getattr(moe_layer, "_tpu_dummy_fp8_initialized", False)
