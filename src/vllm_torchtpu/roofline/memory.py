@@ -33,6 +33,7 @@ from .geometry import LayerCounts, count_layer_types
 from .modules import kv_bytes_per_token_per_layer
 
 if TYPE_CHECKING:
+    from .chips import ChipSpec
     from .geometry import ModelGeometry
     from .modules import Dtypes, Parallel
 
@@ -325,9 +326,10 @@ def _compute_kv_and_state(
     dt: Dtypes,
     parallel: Parallel,
     layout: SeqKvLayout,
-    counts: LayerCounts,
+    chip: ChipSpec | None = None,
 ) -> tuple[float, float]:
     """Compute (kv_bytes, state_bytes) active on one core."""
+    counts = count_layer_types(geom)
     tp = max(1, parallel.tp)
     pp = max(1, parallel.pp)
     if counts.mla > 0:
@@ -338,16 +340,16 @@ def _compute_kv_and_state(
             msg = "MLA layer requires config field 'qk_rope_head_dim'"
             raise ValueError(msg)
     gqa_kv_b_per_tok = kv_bytes_per_token_per_layer(
-        geom, dt, parallel, "gqa", physical=layout.physical_kv_layout
+        geom, dt, parallel, "gqa", physical=layout.physical_kv_layout, chip=chip
     )
     swa_kv_b_per_tok = kv_bytes_per_token_per_layer(
-        geom, dt, parallel, "swa", physical=layout.physical_kv_layout
+        geom, dt, parallel, "swa", physical=layout.physical_kv_layout, chip=chip
     )
     mla_only_kv_b_per_tok = kv_bytes_per_token_per_layer(
-        geom, dt, parallel, "mla", physical=layout.physical_kv_layout
+        geom, dt, parallel, "mla", physical=layout.physical_kv_layout, chip=chip
     )
     dsa_kv_b_per_tok = kv_bytes_per_token_per_layer(
-        geom, dt, parallel, "dsa", physical=layout.physical_kv_layout
+        geom, dt, parallel, "dsa", physical=layout.physical_kv_layout, chip=chip
     )
     kv_div = parallel.kv_split * parallel.pcp * pp
     kv_gqa = (
@@ -394,6 +396,7 @@ def hbm_breakdown_per_core_bytes(
     dt: Dtypes,
     parallel: Parallel,
     layout: SeqKvLayout,
+    chip: ChipSpec | None = None,
 ) -> HbmBreakdown:
     """Compute per-core static weight, active KV cache, and state byte totals."""
     counts = count_layer_types(geom)
@@ -418,7 +421,7 @@ def hbm_breakdown_per_core_bytes(
         else 0.0
     )
     weights = w_attn + w_rec + w_ffn + w_head + w_mtp + w_hc
-    kv, state = _compute_kv_and_state(geom, dt, parallel, layout, counts)
+    kv, state = _compute_kv_and_state(geom, dt, parallel, layout, chip=chip)
     return HbmBreakdown(
         weights=weights,
         kv=kv,
@@ -432,9 +435,10 @@ def hbm_footprint_per_core_bytes(
     dt: Dtypes,
     parallel: Parallel,
     layout: SeqKvLayout,
+    chip: ChipSpec | None = None,
 ) -> float:
     """Compute total HBM footprint (weights + KV + state) in bytes on one core."""
-    return hbm_breakdown_per_core_bytes(geom, dt, parallel, layout).total
+    return hbm_breakdown_per_core_bytes(geom, dt, parallel, layout, chip=chip).total
 
 
 def default_rpa_page_size(ctx_tokens: int) -> int:
@@ -445,13 +449,18 @@ def default_rpa_page_size(ctx_tokens: int) -> int:
     return min(RPA_MAX_PAGE_TOKENS, max(RPA_MIN_PAGE_TOKENS, pow2 // 16))
 
 
-def smem_max_seqs(ctx_tokens: int, kv_split: int, page_size: int) -> int:
+def smem_max_seqs(
+    ctx_tokens: int,
+    kv_split: int,
+    page_size: int,
+    page_table_bytes: int = PAGE_TABLE_BYTE_BUDGET,
+) -> int:
     """Estimate maximum concurrent sequences fitting inside SMEM page tables."""
     pages_per_req = max(
         1,
         math.ceil((ctx_tokens / max(1, kv_split)) / max(1, page_size)),
     )
-    return PAGE_TABLE_BYTE_BUDGET // pages_per_req // BYTES_PER_PAGE_ENTRY
+    return page_table_bytes // pages_per_req // BYTES_PER_PAGE_ENTRY
 
 
 def kv_bytes_per_core_parts(
@@ -461,22 +470,23 @@ def kv_bytes_per_core_parts(
     ctx_tokens: int,
     *,
     physical: bool = True,
+    chip: ChipSpec | None = None,
 ) -> tuple[float, float]:
     """Return (full_context_kv_per_token_bytes, fixed_window_kv_per_seq_bytes)."""
     counts = count_layer_types(geom)
     pp = max(1, parallel.pp)
     kv_div = float(parallel.kv_split * parallel.pcp * pp)
     gqa_kv_b = kv_bytes_per_token_per_layer(
-        geom, dt, parallel, "gqa", physical=physical
+        geom, dt, parallel, "gqa", physical=physical, chip=chip
     )
     swa_kv_b = kv_bytes_per_token_per_layer(
-        geom, dt, parallel, "swa", physical=physical
+        geom, dt, parallel, "swa", physical=physical, chip=chip
     )
     mla_kv_b = kv_bytes_per_token_per_layer(
-        geom, dt, parallel, "mla", physical=physical
+        geom, dt, parallel, "mla", physical=physical, chip=chip
     )
     dsa_kv_b = kv_bytes_per_token_per_layer(
-        geom, dt, parallel, "dsa", physical=physical
+        geom, dt, parallel, "dsa", physical=physical, chip=chip
     )
     plain_eff_mla = max(0.0, counts.eff_mla - counts.eff_dsa)
     linear_part = (
@@ -499,10 +509,13 @@ def kv_capacity_and_hit_rate(
     kv_fit: KvFitInput,
     *,
     fixed_kv_per_seq_bytes: float | None = None,
+    chip: ChipSpec | None = None,
 ) -> tuple[float, float]:
     """Compute physical KV token capacity and clamped prefix cache hit rate."""
     st_b = (
-        hbm_footprint_per_core_bytes(geom, dtypes, parallel, SeqKvLayout(b_res, 0))
+        hbm_footprint_per_core_bytes(
+            geom, dtypes, parallel, SeqKvLayout(b_res, 0), chip=chip
+        )
         - kv_fit.w_base_b
     )
     fixed_seq_b = max(
