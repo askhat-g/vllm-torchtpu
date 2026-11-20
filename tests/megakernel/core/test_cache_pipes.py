@@ -27,11 +27,14 @@ from jax.sharding import PartitionSpec as P
 from tests.megakernel.core.megakernel_fakes import TINY_TILES, make_fake_model_spec
 from tests.megakernel.core.megakernel_synth import SynthHybrid, synth_hybrid_spec
 from vllm_torchtpu.megakernel.core import (
+    _builtins,
     cache,
     decls,
+    fused_io_hook,
     planner,
     pool,
 )
+from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.modules.gdn import GDNModule
 from vllm_torchtpu.megakernel.core.ops import F32
@@ -222,3 +225,20 @@ def test_resolve_pool_layout_from_standalone_model_spec():
     pt, ckpt, roff, min_pages = cache.default_pool_layout(ms, ex)
     assert pt.shape == (4, 2) and ckpt.shape == (1, 4, 1) and roff.shape == (1, 4)
     assert min_pages >= 8
+
+
+def test_should_fuse_pool_io_with_and_without_registered_hook(monkeypatch):
+    """`should_fuse_pool_io` checks `fused_io_available` for `auto` and `True`."""
+    spec = synth_hybrid_spec(L=2, att_every=2, R=2)
+    ex = _make_paged_ex(B=8, T=1, R=2)
+    assert fused_io_hook.fused_io_available()
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is True
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=True) is True
+
+    monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
+    monkeypatch.setattr(fused_io_hook, "_IMPL", None)
+    assert not fused_io_hook.fused_io_available()
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is False
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=False) is False
+    with pytest.raises(MegakernelConfigError, match="fused pool I/O"):
+        cache.should_fuse_pool_io(spec, ex, fused_pool_io=True)
