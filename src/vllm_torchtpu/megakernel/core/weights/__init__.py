@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Weight ops, EPLB packing, and ModelSpec packing (`megakernel.core.weights`)."""
+"""Weight ops, EPLB packing, and ModelSpec input packing (`megakernel.core.weights`)."""
 
 from __future__ import annotations
 
@@ -24,6 +24,11 @@ from .ops import (
     slice_alias_targets,
     target_axis_widths,
 )
+from .spec_inputs import (
+    pack_spec_inputs,
+    random_spec_inputs,
+    random_spec_logical_weights,
+)
 from .spec_pack import pack_spec_logical_weights, switch_branch_for_layer
 
 __all__ = [
@@ -33,7 +38,10 @@ __all__ = [
     "apply_decl_pad",
     "default_eplb_cores",
     "encode_eplb_ecopy",
+    "pack_spec_inputs",
     "pack_spec_logical_weights",
+    "random_spec_inputs",
+    "random_spec_logical_weights",
     "resolve_mapping_ecopy",
     "slice_alias_targets",
     "switch_branch_for_layer",
