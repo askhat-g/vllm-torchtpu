@@ -183,6 +183,7 @@ class TestDummyOnlineFp8MoEWeights:
         moe_layer.renormalize = True
         moe_layer.weight_loader = object()
         method = VllmFp8MoEMethodTPU(cfg, moe_layer.moe_config)
+        method._tpu_topk_weights_float32 = False
         monkeypatch.setattr(
             fp8_mod,
             "_get_moe_quant_config",
