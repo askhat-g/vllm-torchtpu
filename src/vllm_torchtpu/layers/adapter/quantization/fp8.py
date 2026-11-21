@@ -46,6 +46,7 @@ from math import gcd
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.linear import (
@@ -890,6 +891,61 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 self.weight_scale_refine = (block_n // block, block_k // block)
         return hidden_size, intermediate_size_per_partition
 
+    def _create_dummy_online_fp8_weights(
+        self,
+        layer,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+    ) -> bool:
+        """Allocate the runtime FP8 layout directly for ``load_format="dummy"``.
+
+        Online FP8 normally creates BF16 weights and quantizes them after
+        loading. A dummy load has nothing to quantize (the weights arrive later,
+        already in the runtime layout), and the BF16 copy is twice the size of
+        the FP8 one, so allocate the per-channel FP8 weights and their float32
+        inverse scales here. Returns False when this does not apply (a real
+        checkpoint, or a block-quantized MOE_REQUANTIZE_BLOCK_SIZE layout).
+        """
+        vllm_config = (
+            getattr(self.quant_config, "vllm_config", None) or get_current_vllm_config()
+        )
+        if (
+            getattr(getattr(vllm_config, "load_config", None), "load_format", None)
+            != "dummy"
+        ):
+            return False
+        _, requant_dtype, requant_block_size = _get_moe_quant_config(
+            "[MoE dummy online FP8]: allocating dummy FP8 MoE weights"
+        )
+        if requant_block_size is not None:
+            return False
+        aligned = (intermediate_size_per_partition + 127) // 128 * 128
+        params = {
+            "w13_weight": torch.zeros(
+                num_experts, hidden_size, 2 * aligned, dtype=requant_dtype
+            ),
+            "w2_weight": torch.zeros(
+                num_experts, aligned, hidden_size, dtype=requant_dtype
+            ),
+            "w13_weight_scale_inv": torch.ones(
+                num_experts, 1, 1, 2 * aligned, dtype=torch.float32
+            ),
+            "w2_weight_scale_inv": torch.ones(
+                num_experts, 1, 1, hidden_size, dtype=torch.float32
+            ),
+        }
+        for name, data in params.items():
+            param = torch.nn.Parameter(data, requires_grad=False)
+            # vLLM's dummy initializer fills a parameter with this value
+            # instead of random numbers (FP8 has no uniform_).
+            param.dummy_weight_value = 1.0 if name.endswith("_scale_inv") else 0
+            if hasattr(layer, "weight_loader"):
+                param.weight_loader = layer.weight_loader
+            layer.register_parameter(name, param)
+        layer._tpu_dummy_fp8_initialized = True
+        return True
+
     def create_weights(
         self,
         layer,
@@ -963,7 +1019,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                     and hasattr(layer, "weight_loader")
                 ):
                     param.weight_loader = layer.weight_loader
-        else:
+        elif not self._create_dummy_online_fp8_weights(
+            layer, num_experts, hidden_size, intermediate_size_per_partition
+        ):
             from vllm_torchtpu.layers.adapter.quantization.unquantized import (
                 VllmUnquantizedFusedMoEMethod,
             )
@@ -999,44 +1057,65 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
-        is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
-        if is_fp8_serialized:
-            moe_block_shape = getattr(self, "moe_block_shape", self.weight_block_size)
-            weight_block_size = (
-                cast("tuple[int, int]", tuple(moe_block_shape))
-                if moe_block_shape is not None
-                else None
-            )
-            (w13, w13_scale, w2, w2_scale, requant_dtype_name, requant_block_size) = (
-                _process_fp8_moe_weights(
+        if getattr(layer, "_tpu_dummy_fp8_initialized", False):
+            # create_weights already built the runtime per-channel FP8 layout
+            # (load_format="dummy"): nothing to quantize or re-assign.
+            requant_block_size = None
+        else:
+            is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
+            if is_fp8_serialized:
+                moe_block_shape = getattr(
+                    self, "moe_block_shape", self.weight_block_size
+                )
+                weight_block_size = (
+                    cast("tuple[int, int]", tuple(moe_block_shape))
+                    if moe_block_shape is not None
+                    else None
+                )
+                (
+                    w13,
+                    w13_scale,
+                    w2,
+                    w2_scale,
+                    requant_dtype_name,
+                    requant_block_size,
+                ) = _process_fp8_moe_weights(
                     layer,
                     weight_block_size=weight_block_size,
                     activation=activation_str,
                 )
-            )
-        else:
-            (w13, w13_scale, w2, w2_scale, requant_dtype_name, requant_block_size) = (
-                _quantize_bf16_moe_weights(
+            else:
+                (
+                    w13,
+                    w13_scale,
+                    w2,
+                    w2_scale,
+                    requant_dtype_name,
+                    requant_block_size,
+                ) = _quantize_bf16_moe_weights(
                     layer,
                     activation=activation_str,
                 )
+
+            # Remove placeholder checkpoint scales before assigning runtime
+            # inverse scales to prevent nn.Module parameter re-assignment
+            # errors and free state dict memory.
+            # Note: RoutedExperts universally names its parameters w13 (gate+up) and
+            # w2 (down); hasattr is True for serialized FP8 checkpoints and False for
+            # unquantized BF16.
+            if hasattr(layer, f"w13_{self.weight_scale_name}"):
+                delattr(layer, f"w13_{self.weight_scale_name}")
+            if hasattr(layer, f"w2_{self.weight_scale_name}"):
+                delattr(layer, f"w2_{self.weight_scale_name}")
+
+            layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+            layer.w13_weight_scale_inv = torch.nn.Parameter(
+                w13_scale, requires_grad=False
             )
-
-        # Remove placeholder checkpoint scales before assigning runtime inverse scales
-        # to prevent nn.Module parameter re-assignment errors and free
-        # state dict memory.
-        # Note: RoutedExperts universally names its parameters w13 (gate+up) and
-        # w2 (down); hasattr is True for serialized FP8 checkpoints and False for
-        # unquantized BF16.
-        if hasattr(layer, f"w13_{self.weight_scale_name}"):
-            delattr(layer, f"w13_{self.weight_scale_name}")
-        if hasattr(layer, f"w2_{self.weight_scale_name}"):
-            delattr(layer, f"w2_{self.weight_scale_name}")
-
-        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
-        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
-        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
+            layer.w2_weight_scale_inv = torch.nn.Parameter(
+                w2_scale, requires_grad=False
+            )
 
         # Eagerly materialize weights to avoid OOM during vLLM memory probing.
         # Without this, lazy tensors accumulate and the profiling run OOMs.
